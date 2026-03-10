@@ -52,7 +52,20 @@ function getEventName(payload) {
   }
   return payload.event_name || 'unknown_event';
 }
-
+function flattenToScalars(obj, prefix = '') {
+  const result = {};
+  for (const [key, value] of Object.entries(obj)) {
+    const flatKey = prefix ? `${prefix}.${key}` : key;
+    if (value !== null && value !== undefined && typeof value === 'object' && !Array.isArray(value)) {
+      Object.assign(result, flattenToScalars(value, flatKey));
+    } else if (Array.isArray(value)) {
+      result[flatKey] = JSON.stringify(value);
+    } else if (value !== null && value !== undefined) {
+      result[flatKey] = value;
+    }
+  }
+  return result;
+}
 function mapFields(payload) {
   const props = {};
   for (const [singularField, mixpanelField] of Object.entries(FIELD_MAPPING)) {
