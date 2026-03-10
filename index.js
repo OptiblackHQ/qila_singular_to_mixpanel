@@ -66,11 +66,23 @@ function mapFields(payload) {
   if (payload.is_viewthrough !== undefined) {
     props.attribution_touch = payload.is_viewthrough === 1 ? 'view' : 'click';
   }
-  for (const [key, value] of Object.entries(payload)) {
-    if (!FIELD_MAPPING[key] && key !== 'install_utc_timestamp' && key !== 'is_viewthrough') {
+ for (const [key, value] of Object.entries(payload)) {
+    if (FIELD_MAPPING[key]) continue;               // already mapped
+    if (key === 'install_utc_timestamp') continue;  // already mapped
+    if (key === 'is_viewthrough') continue;          // already mapped
+
+    if (value !== null && value !== undefined && typeof value === 'object' && !Array.isArray(value)) {
+      // Flatten nested object and prefix each key with $singular_
+      const flattened = flattenToScalars(value, key);
+      for (const [flatKey, flatValue] of Object.entries(flattened)) {
+        props[`$singular_${flatKey}`] = flatValue;
+      }
+    } else {
+      // Scalar — store directly
       props[`$singular_${key}`] = value;
     }
   }
+
   props.$attribution_source = 'singular';
   props.$attribution_timestamp = new Date().toISOString();
   return props;
