@@ -28,6 +28,9 @@ const FIELD_MAPPING = {
 };
 
 function getDistinctId(payload) {
+  if (payload.global_properties?.MDistinctID) {
+    return payload.global_properties.MDistinctID;
+  }
   return payload.user_id || payload.aifa || payload.idfa || payload.gaid || payload.idfv || null;
 }
 
@@ -98,18 +101,11 @@ function callMixpanel(endpoint, data) {
   });
 }
 
-// Query Mixpanel to find SDK profile by device ID
 function queryProfileByDeviceId(deviceId, platform) {
   return new Promise((resolve, reject) => {
     const propertyName = (platform === 'android') ? 'gps_adid' : 'idfa';
-    
     const whereClause = `properties["${propertyName}"] == "${deviceId}"`;
-    const queryParams = JSON.stringify({
-      where: whereClause
-    });
-    
-    const encodedParams = Buffer.from(queryParams).toString('base64');
-    
+    const encodedParams = Buffer.from(JSON.stringify({ where: whereClause })).toString('base64');
     const options = {
       hostname: 'mixpanel.com',
       port: 443,
@@ -162,12 +158,7 @@ function queryProfileByDeviceId(deviceId, platform) {
 function queryProfileByUserId(userId) {
   return new Promise((resolve, reject) => {
     const whereClause = `properties["user_id"] == "${userId}"`;
-    const queryParams = JSON.stringify({
-      where: whereClause
-    });
-    
-    const encodedParams = Buffer.from(queryParams).toString('base64');
-    
+    const encodedParams = Buffer.from(JSON.stringify({ where: whereClause })).toString('base64');
     const options = {
       hostname: 'mixpanel.com',
       port: 443,
@@ -282,8 +273,8 @@ exports.singularMixpanel = async (req, res) => {
       console.error('[VALIDATION ERROR] No distinct_id found in payload');
       return res.status(400).json({ error: 'No user identifier' });
     }
-    console.log(`[VALIDATION] ✓ distinct_id found: ${distinctId}`);
-    
+
+    const hasMDistinctID = !!payload.global_properties?.MDistinctID;
     const deviceId = getDeviceId(payload);
     const platform = getPlatform(payload);
     const eventName = getEventName(payload);
@@ -291,14 +282,19 @@ exports.singularMixpanel = async (req, res) => {
     const hasUserId = !!payload.user_id;
     const hasDeviceId = !!deviceId;
     const needsUserAlias = hasUserId && hasDeviceId;
-    
+
+    console.log(`[VALIDATION] ✓ distinct_id: ${distinctId}`);
+    console.log(`[VALIDATION] ✓ source: ${hasMDistinctID ? 'MDistinctID (fast path — no merge/alias needed)' : payload.user_id ? 'user_id' : 'device_id'}`);
+
     console.log('[INFO] Processing details:', JSON.stringify({
       event: eventName,
       distinct_id: distinctId,
+      distinct_id_source: hasMDistinctID ? 'MDistinctID' : payload.user_id ? 'user_id' : 'device_id',
+      has_MDistinctID: hasMDistinctID,
       device_id: deviceId,
       user_id: payload.user_id || null,
       platform: platform,
-      needs_user_alias: needsUserAlias,
+      needs_user_alias: !hasMDistinctID && needsUserAlias,
       campaign: payload.campaign || 'none',
       network: payload.network || 'none',
       is_organic: payload.is_organic,
@@ -314,116 +310,118 @@ exports.singularMixpanel = async (req, res) => {
       try {
         attempt++;
         console.log(`\n[ATTEMPT ${attempt}/${CONFIG.MAX_RETRIES}] Starting Mixpanel operations...`);
-        
-        // UPDATED: Step 1 - Query for SDK profile with delay
-        if (attempt === 1 && CONFIG.MIXPANEL_API_SECRET) {
-          // NEW: Add delay before querying to allow SDK properties to sync
-          console.log(`[STEP 0] Waiting ${CONFIG.PROFILE_QUERY_DELAY_MS}ms for SDK properties to sync...`);
-          await new Promise(resolve => setTimeout(resolve, CONFIG.PROFILE_QUERY_DELAY_MS));
-          console.log(`[STEP 0] ✓ Delay complete, proceeding with profile query`);
-          
-          // NEW: Try to find profile by user_id first (if available)
-          if (payload.user_id) {
-            console.log(`[STEP 1A] Querying for SDK profile by user_id...`);
-            sdkProfile = await queryProfileByUserId(payload.user_id);
-            
-            if (sdkProfile.found) {
-              console.log(`[STEP 1A] ✓ SDK profile found by user_id: ${sdkProfile.sdk_distinct_id}`);
+
+        if (hasMDistinctID) {
+          // ── FAST PATH: MDistinctID available ──────────────────────────────
+          // Write directly to the correct SDK profile — no merge/alias needed
+          console.log(`[FAST PATH] MDistinctID found — skipping all merge/alias/query logic`);
+
+          console.log(`[STEP 1] Setting user properties on profile (${distinctId})...`);
+          await setUserProperties(distinctId, properties);
+          console.log('[STEP 1] ✓ User properties set successfully');
+
+          console.log(`[STEP 2] Tracking event "${eventName}" on ${distinctId}...`);
+          await trackEvent(distinctId, eventName, properties);
+          console.log('[STEP 2] ✓ Event tracked successfully');
+
+        } else {
+          // ── FALLBACK PATH: user_id or device_id ───────────────────────────
+          // Run full existing merge/alias/query logic
+          console.log(`[FALLBACK PATH] No MDistinctID — running full merge/alias logic`);
+
+          // Step 1 - Query for SDK profile with delay
+          if (attempt === 1 && CONFIG.MIXPANEL_API_SECRET) {
+            console.log(`[STEP 0] Waiting ${CONFIG.PROFILE_QUERY_DELAY_MS}ms for SDK properties to sync...`);
+            await new Promise(resolve => setTimeout(resolve, CONFIG.PROFILE_QUERY_DELAY_MS));
+            console.log(`[STEP 0] ✓ Delay complete, proceeding with profile query`);
+
+            if (payload.user_id) {
+              console.log(`[STEP 1A] Querying for SDK profile by user_id...`);
+              sdkProfile = await queryProfileByUserId(payload.user_id);
+              if (sdkProfile.found) {
+                console.log(`[STEP 1A] ✓ SDK profile found by user_id: ${sdkProfile.sdk_distinct_id}`);
+              } else {
+                console.log(`[STEP 1A] No SDK profile found by user_id, trying device ID...`);
+              }
+            }
+
+            if (!sdkProfile?.found && deviceId && platform) {
+              console.log(`[STEP 1B] Querying for SDK profile by device ID...`);
+              sdkProfile = await queryProfileByDeviceId(deviceId, platform);
+              if (sdkProfile.found) {
+                console.log(`[STEP 1B] ✓ SDK profile found by device ID: ${sdkProfile.sdk_distinct_id}`);
+              } else {
+                console.log(`[STEP 1B] ✗ No SDK profile found by device ID`);
+              }
+            }
+
+            if (sdkProfile?.found && sdkProfile.sdk_distinct_id !== distinctId) {
+              console.log(`[STEP 2] Attempting to merge profiles...`);
+              console.log(`[STEP 2] From (Singular ID): ${distinctId}`);
+              console.log(`[STEP 2] To (SDK profile): ${sdkProfile.sdk_distinct_id}`);
+              try {
+                await aliasUser(distinctId, sdkProfile.sdk_distinct_id);
+                profileMerged = true;
+                console.log('[STEP 2] ✓✓✓ PROFILES MERGED SUCCESSFULLY ✓✓✓');
+                console.log('[STEP 2] Setting properties on SDK profile...');
+                await setUserProperties(sdkProfile.sdk_distinct_id, properties);
+                console.log('[STEP 2] ✓ Properties set on SDK profile');
+              } catch (mergeError) {
+                console.error('[STEP 2] ✗ Profile merge failed:', mergeError.message);
+              }
+            } else if (sdkProfile?.found) {
+              console.log(`[STEP 2] Skipped - SDK distinct_id matches current distinct_id`);
             } else {
-              console.log(`[STEP 1A] No SDK profile found by user_id, trying device ID...`);
+              console.log(`[STEP 2] Skipped - No SDK profile found to merge`);
+            }
+          } else {
+            if (!CONFIG.MIXPANEL_API_SECRET) {
+              console.log(`[STEP 1] Skipped - MIXPANEL_API_SECRET not configured`);
+            } else {
+              console.log(`[STEP 1] Skipped - Only runs on first attempt`);
             }
           }
-          
-          // ORIGINAL: If not found by user_id, try device ID
-          if (!sdkProfile?.found && deviceId && platform) {
-            console.log(`[STEP 1B] Querying for SDK profile by device ID...`);
-            sdkProfile = await queryProfileByDeviceId(deviceId, platform);
-            
-            if (sdkProfile.found) {
-              console.log(`[STEP 1B] ✓ SDK profile found by device ID: ${sdkProfile.sdk_distinct_id}`);
-            } else {
-              console.log(`[STEP 1B] ✗ No SDK profile found by device ID`);
-              console.log(`[STEP 1B] This means SDK hasn't set ${platform === 'android' ? 'gps_adid' : 'idfa'} property yet`);
-            }
-          }
-          
-          // Step 2: If SDK profile found and different from current distinct_id, merge them
-          if (sdkProfile?.found && sdkProfile.sdk_distinct_id !== distinctId) {
-            console.log(`[STEP 2] Attempting to merge profiles...`);
-            console.log(`[STEP 2] From (Singular ID): ${distinctId}`);
-            console.log(`[STEP 2] To (SDK profile): ${sdkProfile.sdk_distinct_id}`);
-            
+
+          if (needsUserAlias && !userAliased && !profileMerged) {
+            console.log(`[STEP 3] Creating user alias...`);
+            console.log(`[STEP 3] From: ${deviceId}`);
+            console.log(`[STEP 3] To: ${payload.user_id}`);
             try {
-              // Use $create_alias to merge Singular profile into SDK profile
-              await aliasUser(distinctId, sdkProfile.sdk_distinct_id);
-              profileMerged = true;
-              console.log('[STEP 2] ✓✓✓ PROFILES MERGED SUCCESSFULLY ✓✓✓');
-              
-              // Also set properties on SDK profile so it has attribution data
-              console.log('[STEP 2] Setting properties on SDK profile...');
-              await setUserProperties(sdkProfile.sdk_distinct_id, properties);
-              console.log('[STEP 2] ✓ Properties set on SDK profile');
-            } catch (mergeError) {
-              console.error('[STEP 2] ✗ Profile merge failed:', mergeError.message);
-              console.error('[STEP 2] Stack:', mergeError.stack);
-              // Continue anyway
+              await aliasUser(deviceId, payload.user_id);
+              userAliased = true;
+              console.log('[STEP 3] ✓ User alias created successfully');
+            } catch (aliasError) {
+              console.error('[STEP 3] ✗ User alias failed:', aliasError.message);
             }
-          } else if (sdkProfile?.found) {
-            console.log(`[STEP 2] Skipped - SDK distinct_id matches current distinct_id (already same profile)`);
           } else {
-            console.log(`[STEP 2] Skipped - No SDK profile found to merge`);
+            if (profileMerged) {
+              console.log(`[STEP 3] Skipped - Already merged with SDK profile`);
+            } else if (!needsUserAlias) {
+              console.log(`[STEP 3] Skipped - No user_id in payload or no device_id`);
+            } else {
+              console.log(`[STEP 3] Skipped - Already aliased in previous attempt`);
+            }
           }
-        } else {
-          if (!CONFIG.MIXPANEL_API_SECRET) {
-            console.log(`[STEP 1] Skipped - MIXPANEL_API_SECRET not configured`);
-          } else {
-            console.log(`[STEP 1] Skipped - Only runs on first attempt`);
-          }
+
+          const targetDistinctId = (profileMerged && sdkProfile?.sdk_distinct_id) ? sdkProfile.sdk_distinct_id : distinctId;
+
+          console.log(`[STEP 4] Setting user properties on profile (${targetDistinctId})...`);
+          await setUserProperties(targetDistinctId, properties);
+          console.log('[STEP 4] ✓ User properties set successfully');
+
+          console.log(`[STEP 5] Tracking event "${eventName}" on ${targetDistinctId}...`);
+          await trackEvent(targetDistinctId, eventName, properties);
+          console.log('[STEP 5] ✓ Event tracked successfully');
         }
-        
-        // Step 3: Create user alias if user_id exists (and not already merged with SDK profile)
-        if (needsUserAlias && !userAliased && !profileMerged) {
-          console.log(`[STEP 3] Creating user alias...`);
-          console.log(`[STEP 3] From: ${deviceId}`);
-          console.log(`[STEP 3] To: ${payload.user_id}`);
-          
-          try {
-            await aliasUser(deviceId, payload.user_id);
-            userAliased = true;
-            console.log('[STEP 3] ✓ User alias created successfully');
-          } catch (aliasError) {
-            console.error('[STEP 3] ✗ User alias failed:', aliasError.message);
-            // Continue anyway
-          }
-        } else {
-          if (profileMerged) {
-            console.log(`[STEP 3] Skipped - Already merged with SDK profile`);
-          } else if (!needsUserAlias) {
-            console.log(`[STEP 3] Skipped - No user_id in payload or no device_id`);
-          } else {
-            console.log(`[STEP 3] Skipped - Already aliased in previous attempt`);
-          }
-        }
-        
-        // Step 4: Set properties (on SDK profile if merged, otherwise on distinct_id)
-        const targetDistinctId = (profileMerged && sdkProfile?.sdk_distinct_id) ? sdkProfile.sdk_distinct_id : distinctId;
-        console.log(`[STEP 4] Setting user properties on profile (${targetDistinctId})...`);
-        await setUserProperties(targetDistinctId, properties);
-        console.log('[STEP 4] ✓ User properties set successfully');
-        
-        // Step 5: Track event (on SDK profile if merged, otherwise on distinct_id)
-        console.log(`[STEP 5] Tracking event "${eventName}" on ${targetDistinctId}...`);
-        await trackEvent(targetDistinctId, eventName, properties);
-        console.log('[STEP 5] ✓ Event tracked successfully');
-        
+
         const duration = Date.now() - startTime;
         console.log(`\n[SUCCESS] === ALL OPERATIONS COMPLETED IN ${duration}ms ===`);
-        
-        // UPDATED: Response includes correct profile merge status
+
         const responseData = {
           success: true,
           event: eventName,
-          distinct_id: targetDistinctId,
+          distinct_id: distinctId,
+          distinct_id_source: hasMDistinctID ? 'MDistinctID' : payload.user_id ? 'user_id' : 'device_id',
           sdk_profile_found: sdkProfile?.found || false,
           sdk_distinct_id: sdkProfile?.sdk_distinct_id || null,
           profiles_merged: profileMerged,
